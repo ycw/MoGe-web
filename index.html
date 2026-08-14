@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MoGe-web</title>
+  <base target="_blank">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@~0.185/build/three.webgpu.js",
+      "three/webgpu": "https://unpkg.com/three@~0.185/build/three.webgpu.js",
+      "three/addons/": "https://unpkg.com/three@~0.185/examples/jsm/",
+      "three/tsl": "https://unpkg.com/three@~0.185/build/three.tsl.js",
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.all.min.mjs"
+    }
+  }
+  </script>
+  <script type="module">
+    // ===
+    // MoGe2
+    // ===
+
+    import * as ort from 'onnxruntime-web'
+
+    class MoGe2 {
+      #session
+      constructor({ session }) {
+        this.#session = session
+      }
+      
+      static async create({ model_url }) {
+        const session = await ort.InferenceSession.create(model_url, {
+          executionProviders: ['webgpu', 'wasm'],
+          graphOptimizationLevel: 'all'
+        })
+        return new MoGe2({ session })
+      }
+      
+      static canvas_to_image_tensor({ canvas }) {
+        const sw = canvas.width
+        const sh = canvas.height
+        const src = canvas.getContext('2d').getImageData(0, 0, sw, sh).data
+        const n_pixels = sw * sh
+        const dst = new Float32Array(3 * n_pixels) // rgb data
+        for (let i = 0; i < n_pixels; ++i) {
+          dst[i] = src[i * 4] / 255 // r
+          dst[n_pixels + i] = src[i * 4 + 1] / 255 // g
+          dst[n_pixels * 2 + i] = src[i * 4 + 2] / 255 // b
+        }
+        return new ort.Tensor('float32', dst, [1, 3, sh, sw]) // NCHW
+      }
+
+      static normal_tensor_to_canvas({ tensor }) {
+        const sw = tensor.dims[2] // NHWC [1, h, w, 3]
+        const sh = tensor.dims[1]
+        const src = tensor.data // f32a, xyz data, y down, z forward, in [-1,1]
+        const n_pixels = sw * sh
+        const dst = new Uint8ClampedArray(4 * n_pixels) // u8ca, rgba data, y up, z backward, in [0,255]
+        for (let i = 0; i < n_pixels; ++i) {
+          dst[i * 4] = (src[i * 3] + 1) * 127.5  // r=(x+1)*2/255
+          dst[i * 4 + 1] = (-src[i * 3 + 1] + 1) * 127.5 // g=(-y+1)*2/255 #flip-y
+          dst[i * 4 + 2] = (-src[i * 3 + 2] + 1) * 127.5 // b=(-z+1)*2/255 #flip-z
+          dst[i * 4 + 3] = 255 // a
+        }
+        const canvas = new OffscreenCanvas(sw, sh)
+        canvas.getContext('2d').putImageData(new ImageData(dst, sw, sh), 0, 0)
+        return canvas
+      }
+
+      async infer_normal({ canvas, res=9 }) {
+        const image_tensor = MoGe2.canvas_to_image_tensor({ canvas })
+        const num_tokens = (1200 + res / 9 * (3600 - 1200)) | 0  // [0,9] -> [1200,3600]
+        const num_tokens_tensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(num_tokens)]), [])
+   
+        const result = await this.#session.run({ image: image_tensor, num_tokens: num_tokens_tensor })
+        const normal_canvas = MoGe2.normal_tensor_to_canvas({ tensor: result.normal })
+        
+        result.mask.dispose()
+        result.normal.dispose()
+        result.points.dispose()
+        result.scale?.dispose()  // vits-normal.onnx
+        result.metric_scale?.dispose() // non vits-normal.onnx
+        image_tensor.dispose()
+        num_tokens_tensor.dispose()
+  
+        return normal_canvas
+      }
+    }
+
+    // ===
+    // HTML Utilities
+    // ===
+
+    class HTMLUtil {
+      static image_to_canvas({ img, contain }) {
+        const sw = img.width
+        const sh = img.height
+        const scale = contain === undefined ? 1 : contain / Math.max(sw, sh)
+        const dw = sw * scale
+        const dh = sh * scale
+        const canvas = new OffscreenCanvas(dw, dh)
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(img, 0, 0, sw, sh, 0, 0, dw, dh)
+        return canvas
+      }
+      static async canvas_to_image({ canvas }) {
+        const blob = await canvas.convertToBlob()
+        const img = new Image()
+        img.src = URL.createObjectURL(blob)
+        return img
+      }
+    }
+    
+    // ===
+    // Previwer
+    // ===
+
+    import * as THREE from 'three/webgpu'
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+    import { DragControls } from 'three/addons/controls/DragControls.js'
+
+    class ThreeJSPreviewer {
+      
+      constructor({ renderer }) {
+        this.renderer = renderer
+        const scene = new THREE.Scene()
+        const camera = new THREE.PerspectiveCamera()
+        const controls = new OrbitControls(camera, renderer.domElement)
+        scene.background = new THREE.Color(0x7f7f7f)
+        camera.position.set(0, 0, 15)
+        
+        const light0 = new THREE.PointLight('white', Math.PI * 5)
+        const light0_gizmo = new THREE.Mesh(
+          new THREE.SphereGeometry(0.5), 
+          new THREE.MeshBasicMaterial({ color: 0xffea00 })
+        )
+        light0_gizmo.add(light0)
+        light0_gizmo.position.set(0, 0, 1)
+        scene.add(light0_gizmo)
+        
+        scene.add(new THREE.AmbientLight('white', 0.1))
+        
+        const drag_controls = new DragControls([light0_gizmo], camera, renderer.domElement)
+        drag_controls.addEventListener('dragstart', () => controls.enabled = false)
+        drag_controls.addEventListener('dragend', () => controls.enabled = true)
+
+        const mat = new THREE.MeshLambertMaterial({ side: THREE.DoubleSide, transparent: true})
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), mat)
+        scene.add(mesh)
+    
+        renderer.setAnimationLoop(() => renderer.render(scene, camera))
+
+        let resize_timeout
+        new ResizeObserver(([e]) => {
+          const w = e.contentBoxSize[0].inlineSize
+          const h = e.contentBoxSize[0].blockSize
+          if (w === 0 || h === 0) return
+          clearTimeout(resize_timeout)
+          resize_timeout = setTimeout(() => {
+            renderer.setPixelRatio(devicePixelRatio)
+            renderer.setSize(w, h, false)
+            camera.aspect = w / h
+            camera.updateProjectionMatrix()
+          }, 1)
+        }).observe(el_preview)
+        el_preview.append(renderer.domElement)
+        controls.saveState()
+        controls.update()
+
+        this.mat = mat
+        this.mesh = mesh
+        this.controls = controls
+        this.light0_gizmo = light0_gizmo
+      }
+
+      static async create() {
+        const renderer = await new THREE.WebGPURenderer().init()
+        return new ThreeJSPreviewer({ renderer })
+      }
+
+      preview({ input_canvas, normal_canvas }) {
+        this.light0_gizmo.position.set(0, 0, 1)
+        this.controls.reset()
+        this.mat.map?.dispose()
+        this.mat.map = new THREE.CanvasTexture(input_canvas)
+        this.mat.normalMap?.dispose()
+        this.mat.normalMap = new THREE.CanvasTexture(normal_canvas)
+        this.mat.needsUpdate = true
+        this.mesh.scale.x = input_canvas.width / input_canvas.height
+      }
+    }
+    
+    // ===
+    // App
+    // ===
+
+    const app = {
+      state: 'setup', // 'setup' | 'started'
+      moge: null,
+      previewer: null,
+      input_canvas: null, // last input canvas
+      res: 9, // in [0,9], affect base vit tokens count 
+      max_dim: 0, // resize input canvas during inference, 0 means no resize
+      set_input_canvas({ canvas }) {
+        if (canvas) {
+          this.input_canvas = canvas
+          this.enable_controls({ file_input: true, others: true })
+        } else {
+          this.input_canvas = null
+          this.enable_controls({ file_input: true, others: false })
+        }
+      },
+      async infer_normal() {
+        this.enable_controls({ file_input: false, others: false })
+        const { input_canvas, res, max_dim } = this
+
+        // resize input canvas, preserve aspect ratio
+        const working_input_canvas = (max_dim > 0)
+          ? HTMLUtil.image_to_canvas({ img: input_canvas, contain: max_dim })
+          : input_canvas
+        
+        this.set_status('Running inference ...')
+        const t0 = performance.now()
+        const working_normal_canvas = await this.moge.infer_normal({ canvas: working_input_canvas, res })
+        const dur = ((performance.now() - t0) / 1000).toFixed(2)
+        this.set_status(`Inference done in ${dur}s`)
+
+        // resize normal canvas to match original input canvas
+        const normal_canvas = (max_dim > 0)
+          ? HTMLUtil.image_to_canvas({ img: working_normal_canvas, contain: Math.max(input_canvas.width, input_canvas.height) })
+          : working_normal_canvas
+
+        const input_image = await HTMLUtil.canvas_to_image({ canvas: input_canvas })
+        this.set_image(el_input_image_container, input_image)
+        const normal_image = await HTMLUtil.canvas_to_image({ canvas: normal_canvas })
+        this.set_image(el_normal_image_container, normal_image)
+
+        this.previewer.preview({ input_canvas, normal_canvas })
+        this.enable_controls({ file_input: true, others: true })
+      },
+      enable_controls({ file_input, others }) {
+        el_input.disabled = !file_input
+        el_res.disabled = !others
+        el_max_dim.disabled = !others
+      },
+      set_image(container_el, img) {
+        const old_img = container_el.querySelector('img')
+        if (old_img) {
+          URL.revokeObjectURL(old_img.src)
+          old_img.remove()
+        }
+        container_el.append(img)
+      },
+      set_status(status) {
+        document.body.dataset.status = status
+        el_status.textContent = status
+      },
+      set_state(state) {
+        this.state = state
+        document.body.dataset.state = state
+      }
+    }
+
+    // ===
+    // App - Events
+    // ===
+
+    el_model_container.addEventListener('submit', async e => {
+      e.preventDefault()
+      e.target.hidden = true
+      try {
+        app.set_status("Loading model ...")
+        const t0 = performance.now()
+        app.moge = await MoGe2.create({ model_url: el_model_url.value })
+        const dur = ((performance.now() - t0) / 1000).toFixed(2) 
+        app.set_status(`Model loaded in ${dur}s. Please select image, or paste image`)
+        app.set_state('started')
+        app.previewer = await ThreeJSPreviewer.create()
+      } catch (err) {
+        app.set_status(err.message)
+        e.target.hidden = false // let user retry
+      }
+    })
+
+    el_input.addEventListener('input', async e => {
+      const file = e.target.files[0]
+      if (!file) return
+      
+      const input_bitmap = await createImageBitmap(file)
+      const input_canvas = HTMLUtil.image_to_canvas({ img: input_bitmap })
+      input_bitmap.close()
+
+      app.set_input_canvas({ canvas: input_canvas })
+      await app.infer_normal()
+    })
+
+    el_res.addEventListener('change', async e => {
+      app.res = Number.parseInt(e.target.value)
+      await app.infer_normal()
+    })
+
+    let timer_max_dim_onchange
+    el_max_dim.addEventListener('change', async e => {
+      clearTimeout(timer_max_dim_onchange)
+      timer_max_dim_onchange = setTimeout(async () => {
+        app.max_dim = Number.parseInt(e.target.value)
+        await app.infer_normal()
+      }, 200)
+    })
+
+    document.addEventListener('paste', async e => {
+      if (app.state === 'setup') return
+
+      const items = e.clipboardData?.items
+      if (!items) return
+
+      let image_file = null
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          image_file = item.getAsFile()
+          break
+        }
+      }
+      if (image_file) {
+        const input_bitmap = await createImageBitmap(image_file)
+        const input_canvas = HTMLUtil.image_to_canvas({ img: input_bitmap })
+        input_bitmap.close()
+
+        app.set_input_canvas({ canvas: input_canvas })
+        await app.infer_normal()
+      }
+    })
+
+  </script>
+</head>
+<body data-state="setup">
+  <nav>
+    <a href="https://github.com/ycw/MoGe-web">MoGe-web</a> | 
+    <a href="https://x.com/ycwhk">@ycwhk</a> | 
+    <pre id="el_status"><code>Please load model</code></pre>
+  </nav>
+  <form id="el_model_container">
+    <input id="el_model_url" value="./moge-2-vits-normal-onnx.onnx">
+    <button type="submit" id="el_model_submit">load model</button>
+    <br>
+    Accept urls, e.g.:
+    <ul>
+      <li>https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx | 141 MB</li>
+      <li>https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx | 419 MB</li>
+      <li>https://huggingface.co/Ruicheng/moge-2-vitl-normal-onnx/resolve/main/model.onnx | 1.32 GB</li>
+    </ul>
+  </form>
+  <main>
+    <div id="el_controls">
+      <input type="file" id="el_input">
+      <label title="Affect tokens count. Higher the res, higher the detail">
+        Res
+        <select id="el_res" disabled>
+          <option>0</option>
+          <option>1</option>
+          <option>2</option>
+          <option>3</option>
+          <option>4</option>
+          <option>5</option>
+          <option>6</option>
+          <option>7</option>
+          <option>8</option>
+          <option selected>9</option>
+        </select>
+      </label>
+      <label title="Resize input image for inference, 0=no resize. Only affect inference">
+        MaxDim
+        <input type="number" id="el_max_dim" value="0" disabled >
+      </label>
+    </div>
+    <div id="el_input_image_container"></div>
+    <div id="el_normal_image_container"></div>
+    <div id="el_preview"></div>
+  </main>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100vh; }
+    pre { display: inline }
+    [hidden] { display: none }
+    body {
+      font: 1em monospace;
+      padding: 1em; box-sizing: border-box;
+      &[data-state=setup] { 
+        & main { display: none }
+      }
+      &[data-state=started] {
+        & #el_model_container { display: none }
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        height: 100vh;
+        gap: 1em;
+      }
+    }
+    main {
+      display: grid; gap: 1em; 
+      grid-template:
+        'controls controls' auto
+        'preview input_image_container' minmax(0,1fr)
+        'preview normal_image_container' minmax(0,1fr)
+      / 3fr 2fr;
+    }
+    #el_model_container {
+      margin: 1em;
+      & #el_model_url { width: 50vw }
+    }
+    #el_controls { grid-area: controls }
+    #el_input_image_container { grid-area: input_image_container }
+    #el_normal_image_container { grid-area: normal_image_container }
+    #el_preview { grid-area: preview }
+    img { display:block; width: 100%; height: 100%; object-fit: contain; background: #7f7f7f }
+    canvas { display: block; width: 100%; height: 100% }
+  </style>
+</body>
+</html>
