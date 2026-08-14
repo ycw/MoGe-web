@@ -30,7 +30,7 @@
       
       static async create({ model_url }) {
         const session = await ort.InferenceSession.create(model_url, {
-          executionProviders: ['webgpu', 'wasm'],
+          executionProviders: ['webgpu'],
           graphOptimizationLevel: 'all'
         })
         return new MoGe2({ session })
@@ -183,6 +183,7 @@
         this.controls.reset()
         this.mat.map?.dispose()
         this.mat.map = new THREE.CanvasTexture(input_canvas)
+        this.mat.map.colorSpace = THREE.SRGBColorSpace
         this.mat.normalMap?.dispose()
         this.mat.normalMap = new THREE.CanvasTexture(normal_canvas)
         this.mat.needsUpdate = true
@@ -340,10 +341,9 @@
     <pre id="el_status"><code>Please load model</code></pre>
   </nav>
   <form id="el_model_container">
-    <input id="el_model_url" value="./moge-2-vits-normal-onnx.onnx">
+    <input id="el_model_url" value="https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx">
     <button type="submit" id="el_model_submit">load model</button>
     <br>
-    Accept urls, e.g.:
     <ul>
       <li>https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx | 141 MB</li>
       <li>https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx | 419 MB</li>
@@ -352,7 +352,7 @@
   </form>
   <main>
     <div id="el_controls">
-      <input type="file" id="el_input">
+      <input type="file" id="el_input" accept="image/*">
       <label title="Affect tokens count. Higher the res, higher the detail">
         Res
         <select id="el_res" disabled>
