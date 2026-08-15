@@ -17,37 +17,59 @@
   </script>
   <script type="module">
     // ===
-    // MoGe2
+    // Tensor Utilities
     // ===
 
     import * as ort from 'onnxruntime-web'
 
+    class TensorUtil {
+
+      static create_js_buffer({ dtype, args }) {
+        if (dtype === 'float16') return new Float16Array(...args)
+        if (dtype === 'float32') return new Float32Array(...args)
+      }
+
+      static create_tensor({ dtype, args }) {
+        if (dtype === 'float16') return new ort.Tensor(dtype, ...args)
+        if (dtype === 'float32') return new ort.Tensor(dtype, ...args)
+      }
+
+    }
+
+    // ===
+    // MoGe2
+    // ===
+
     class MoGe2 {
+
       #session
-      constructor({ session }) {
+      #dtype
+
+      constructor({ session, dtype }) {
         this.#session = session
+        this.#dtype = dtype
       }
       
-      static async create({ model_url }) {
+      static async create({ model_url, dtype }) {
         const session = await ort.InferenceSession.create(model_url, {
           executionProviders: ['webgpu'],
           graphOptimizationLevel: 'all'
         })
-        return new MoGe2({ session })
+        return new MoGe2({ session, dtype })
       }
       
-      static canvas_to_image_tensor({ canvas }) {
+      static canvas_to_image_tensor({ canvas, dtype }) {
         const sw = canvas.width
         const sh = canvas.height
         const src = canvas.getContext('2d').getImageData(0, 0, sw, sh).data
         const n_pixels = sw * sh
-        const dst = new Float32Array(3 * n_pixels) // rgb data
+        const dst = TensorUtil.create_js_buffer({ dtype, args: [3 * n_pixels] }) // rgb data
         for (let i = 0; i < n_pixels; ++i) {
           dst[i] = src[i * 4] / 255 // r
           dst[n_pixels + i] = src[i * 4 + 1] / 255 // g
           dst[n_pixels * 2 + i] = src[i * 4 + 2] / 255 // b
         }
-        return new ort.Tensor('float32', dst, [1, 3, sh, sw]) // NCHW
+        return TensorUtil.create_tensor({ dtype, args: [dst, [1, 3, sh, sw]]}) // NCHW
       }
 
       static normal_tensor_to_canvas({ tensor }) {
@@ -68,7 +90,7 @@
       }
 
       async infer_normal({ canvas, res=9 }) {
-        const image_tensor = MoGe2.canvas_to_image_tensor({ canvas })
+        const image_tensor = MoGe2.canvas_to_image_tensor({ canvas, dtype: this.#dtype })
         const num_tokens = (1200 + res / 9 * (3600 - 1200)) | 0  // [0,9] -> [1200,3600]
         const num_tokens_tensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(num_tokens)]), [])
    
@@ -85,6 +107,7 @@
   
         return normal_canvas
       }
+
     }
 
     // ===
@@ -92,6 +115,7 @@
     // ===
 
     class HTMLUtil {
+
       static image_to_canvas({ img, contain }) {
         const sw = img.width
         const sh = img.height
@@ -103,16 +127,18 @@
         ctx.drawImage(img, 0, 0, sw, sh, 0, 0, dw, dh)
         return canvas
       }
+
       static async canvas_to_image({ canvas }) {
         const blob = await canvas.convertToBlob()
         const img = new Image()
         img.src = URL.createObjectURL(blob)
         return img
       }
+
     }
     
     // ===
-    // Previwer
+    // Previewer
     // ===
 
     import * as THREE from 'three/webgpu'
@@ -189,6 +215,7 @@
         this.mat.needsUpdate = true
         this.mesh.scale.x = input_canvas.width / input_canvas.height
       }
+
     }
     
     // ===
@@ -271,8 +298,10 @@
       e.target.hidden = true
       try {
         app.set_status("Loading model ...")
+        const model_url = el_model_url.value
+        const dtype = el_model_dtype.value
         const t0 = performance.now()
-        app.moge = await MoGe2.create({ model_url: el_model_url.value })
+        app.moge = await MoGe2.create({ model_url, dtype })
         const dur = ((performance.now() - t0) / 1000).toFixed(2) 
         app.set_status(`Model loaded in ${dur}s. Please select image, or paste image`)
         app.set_state('started')
@@ -341,13 +370,18 @@
     <pre id="el_status"><code>Please load model</code></pre>
   </nav>
   <form id="el_model_container">
-    <input id="el_model_url" value="https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx">
+    <input id="el_model_url" value="moge-2-vits-normal-fp16.onnx">
+    <select id="el_model_dtype">
+      <option>float16</option>
+      <option>float32</option>
+    </select>
     <button type="submit" id="el_model_submit">load model</button>
     <br>
     <ul>
-      <li>https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx | 141 MB</li>
-      <li>https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx | 419 MB</li>
-      <li>https://huggingface.co/Ruicheng/moge-2-vitl-normal-onnx/resolve/main/model.onnx | 1.32 GB</li>
+      <li>https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx |float32| 141 MB</li>
+      <li>https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx |float32| 419 MB</li>
+      <li>https://huggingface.co/Ruicheng/moge-2-vitl-normal-onnx/resolve/main/model.onnx |float32| 1.32 GB</li>
+      <li>https://ycw.github.io/moge-2-vits-normal-fp16.onnx |float16| 73 MB</li>
     </ul>
   </form>
   <main>
