@@ -146,6 +146,7 @@
     // ===
 
     class HTMLUtil {
+      // Draw any image source to a new canvas
       static image_to_canvas({ img, contain }) {
         const sw = img.width
         const sh = img.height
@@ -182,7 +183,7 @@
         camera.position.set(0, 0, 12)
         controls.enableRotate = false
 
-        this.render = () => renderer.render(scene, camera)
+        this.render = () => renderer.render(scene, camera) 
 
         const light0 = new THREE.PointLight('white', Math.PI * 5, 0, 2)
         const light0_gizmo = new THREE.Mesh(
@@ -201,9 +202,9 @@
           light0_gizmo.material.opacity = 1
           this.render()
         })
-        drag_controls.addEventListener('drag', this.render.bind(this))
+        drag_controls.addEventListener('drag', () => this.render())
 
-        const mat = new THREE.MeshLambertMaterial({ side: THREE.DoubleSide, transparent: true})
+        const mat = new THREE.MeshLambertMaterial({ transparent: true })
         const mesh = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), mat)
         scene.add(mesh)
     
@@ -234,6 +235,7 @@
         this.controls = controls
         this.light0_gizmo = light0_gizmo
         this.container_el = container_el
+        this.max_tdim = renderer.backend.device.limits.maxTextureDimension2D
       }
       static async create({ container_el }) {
         return new Previewer({
@@ -245,13 +247,21 @@
         this.light0_gizmo.position.set(0, 0, 0.5)
         this.controls.reset()
         this.mat.map?.dispose()
-        this.mat.map = new THREE.CanvasTexture(input_canvas)
+        this.mat.map = this.create_canvas_texture({ canvas: input_canvas })
         this.mat.map.colorSpace = THREE.SRGBColorSpace
         this.mat.normalMap?.dispose()
-        this.mat.normalMap = new THREE.CanvasTexture(normal_canvas)
+        this.mat.normalMap = this.create_canvas_texture({ canvas: normal_canvas })
         this.mat.needsUpdate = true
         this.mesh.scale.x = input_canvas.width / input_canvas.height
         this.render()
+      }
+      create_canvas_texture({ canvas }) {
+        // resize to fit max texture dimension 2d, avoid crash for hires input
+        return new THREE.CanvasTexture(
+          Math.max(canvas.width, canvas.height) > this.max_tdim
+            ? HTMLUtil.image_to_canvas({ img: canvas, contain: this.max_tdim })
+            : canvas
+        )
       }
     }
     
@@ -276,10 +286,12 @@
       #input_canvas = null // cache
       #input_img = null // cache, `src` is a blob url
       #normal_img = null // cache `src` is a blob url
-      #res = el_res.value
-      #max_dim = el_max_dim.value
+      #res = 9
+      #max_dim = 518
       constructor() {
         this.register_events()
+        el_res.value = this.#res
+        el_max_dim.value = this.#max_dim
       }
       set_input_canvas({ canvas }) {
         this.#input_canvas = canvas || null
@@ -314,12 +326,15 @@
       }
       async infer_normal() {
         if (this.#state !== 'idle') return
+
         this.set_state('inference')
         this.enable_controls({ file_input: false, others: false })
 
         const input_canvas = this.#input_canvas
         const res = this.#res
         const max_dim = this.#max_dim
+
+        const t0_app = performance.now()
 
         // resize input canvas, preserve aspect ratio
         const working_input_canvas = (max_dim > 0)
@@ -328,11 +343,9 @@
         
         this.set_status('Running inference ...')
         let working_normal_canvas
+        const t0_moge = performance.now()
         try {
-          const t0 = performance.now()
           working_normal_canvas = await this.#moge.infer_normal({ canvas: working_input_canvas, res })
-          const dur = ((performance.now() - t0) / 1000).toFixed(2)
-          this.set_status(`Inference done in ${dur}s`)
         } catch (err) {
           console.error(err)
           this.set_status(err.message)
@@ -340,6 +353,7 @@
           this.set_state('idle')
           return
         }
+        const t1_moge = performance.now()
 
         // resize working normal canvas to match the original input canvas
         const normal_canvas = (max_dim > 0)
@@ -356,6 +370,13 @@
         this.#previewer.preview({ input_canvas, normal_canvas })
         this.enable_controls({ file_input: true, others: true })
         this.set_state('idle')
+
+        const t1_app = performance.now()
+        const dur_app = t1_app - t0_app
+        const dur_moge = t1_moge - t0_moge 
+        const dur_rest = dur_app - dur_moge
+        const fmt = dur => (dur / 1000).toFixed(2) + 's'
+        this.set_status(`Done in ${fmt(dur_app)}. (moge ${fmt(dur_moge)}, rest ${fmt(dur_rest)})`)
       }
       register_events() {
         el_model_container.addEventListener('submit', this.on_submit.bind(this))
@@ -378,12 +399,13 @@
           this.#moge = await MoGe2.create({ model_url, dtype })
           const dur = ((performance.now() - t0) / 1000).toFixed(2) 
           this.set_status(`Model loaded in ${dur}s. Please select image, or paste image`)
-          this.set_state('idle')
           this.#previewer = await Previewer.create({ container_el: el_preview_container })
         } catch (err) {
+          console.error(err)
           this.set_status(err.message)
           e.target.hidden = false // let user retry
-          console.error(err)
+        } finally {
+          this.set_state('idle')
         }
       }
       async on_input(e) {
@@ -458,7 +480,7 @@
       <label title="Affect tokens count. Higher the res, higher the detail">
         / Res
         <select id="el_res" disabled>
-          <option selected>0</option>
+          <option>0</option>
           <option>1</option>
           <option>2</option>
           <option>3</option>
@@ -472,7 +494,7 @@
       </label>
       <label title="Resize input image for inference, 0=no resize. Only affect inference">
         / MaxDim
-        <input type="number" id="el_max_dim" value="0" disabled>
+        <input type="number" id="el_max_dim" disabled min="0">
       </label>
     </div>
     <div id="el_input_image_container" class="output_container" hidden>
