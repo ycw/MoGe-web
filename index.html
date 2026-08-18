@@ -17,6 +17,7 @@
   </script>
   <script type="module">
     import * as ort from 'onnxruntime-web'
+    import { normal_tensor_to_canvas } from './normal_tensor_to_canvas.js'
 
     // ===
     // Onnxruntime Utilities
@@ -64,64 +65,16 @@
         }
         return ORTTensor.create({ dtype, buffer, dims: [1, 3, sh, sw] })
       }
-      // NHWC tensor(f32, 3ch) -> imageData(u8a, 4ch, 0..255)
-      //  ONNX export lacks smooth interpolation, applies bilateral filtering for ViT patch artifacts.
-      static to_canvas({
+      static async to_canvas({
         tensor,
-        transform,
         smoothing_threshold_deg = 8.0,
         kernel_radius = 7
       }) {
-        const sw = tensor.dims[2] // NHWC [1, h, w, 3]
-        const sh = tensor.dims[1]  
-        const src = tensor.data // f32a
-        const dst = new Uint8ClampedArray(4 * sw * sh)
-
-        const threshold_cos = Math.cos((smoothing_threshold_deg * Math.PI) / 180)
-        const sigma_sq = 2 * ((1 - threshold_cos) ** 2) || 1e-5
-        const r = kernel_radius
-
-        for (let y = 0; y < sh; ++y) {
-          for (let x = 0; x < sw; ++x) {
-            const c_idx = (y * sw + x) * 3
-            const [cx, cy, cz] = [src[c_idx], src[c_idx + 1], src[c_idx + 2]]
-            let [sum_x, sum_y, sum_z, total_weight] = [0, 0, 0, 0]
-
-            // Stride 2 for speed
-            for (let dy = -r; dy <= r; dy += 2) {
-              const ny = Math.min(Math.max(y + dy, 0), sh - 1)
-              for (let dx = -r; dx <= r; dx += 2) {
-                const nx = Math.min(Math.max(x + dx, 0), sw - 1)
-                const n_idx = (ny * sw + nx) * 3
-                const [px, py, pz] = [src[n_idx], src[n_idx + 1], src[n_idx + 2]]
-
-                // dot product of surface normals
-                const cos_theta = cx * px + cy * py + cz * pz
-
-                // smooth if within angle threshold; reject geometric edges
-                if (cos_theta >= threshold_cos) {
-                  const diff = 1 - cos_theta
-                  const weight = Math.exp(-(diff * diff) / sigma_sq)
-
-                  sum_x += px * weight
-                  sum_y += py * weight
-                  sum_z += pz * weight
-                  total_weight += weight
-                }
-              }
-            }
-
-            const smoothed = total_weight > 0
-              ? [sum_x / total_weight, sum_y / total_weight, sum_z / total_weight]
-              : [cx, cy, cz]
-
-            dst.set(transform(smoothed), (y * sw + x) * 4)
-          }
-        }
-
-        const canvas = new OffscreenCanvas(sw, sh)
-        canvas.getContext('2d').putImageData(new ImageData(dst, sw, sh), 0, 0)
-        return canvas
+        return await normal_tensor_to_canvas({
+          tensor,
+          smoothing_threshold_deg,
+          kernel_radius
+        })
       }
     }
 
@@ -163,15 +116,11 @@
             num_tokens: num_tokens_tensor
           }
         })
-
-        const normal_canvas = ORTTensor.to_canvas({
+        
+        const normal_canvas = await ORTTensor.to_canvas({
           tensor: result.normal,
-          transform: ([x, y, z]) => [
-            (x + 1) * 127.5,
-            (-y + 1) * 127.5, // y down -> up
-            (-z + 1) * 127.5, // z forward -> backward
-            255
-          ]
+          smoothing_threshold_deg: 8,
+          kernel_radius: 7
         })
 
         result.mask.dispose()
