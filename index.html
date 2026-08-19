@@ -65,16 +65,8 @@
         }
         return ORTTensor.create({ dtype, buffer, dims: [1, 3, sh, sw] })
       }
-      static async to_canvas({
-        tensor,
-        smoothing_threshold_deg = 8.0,
-        kernel_radius = 7
-      }) {
-        return await normal_tensor_to_canvas({
-          tensor,
-          smoothing_threshold_deg,
-          kernel_radius
-        })
+      static async to_canvas(opt) {
+        return await normal_tensor_to_canvas(opt)
       }
     }
 
@@ -110,12 +102,14 @@
           dims: []
         })
 
+        performance.mark('moge_infer')
         const result = await this.#session.run({
           option: {
             image: image_tensor,
             num_tokens: num_tokens_tensor
           }
         })
+        performance.measure('moge_infer', 'moge_infer')
         
         const normal_canvas = await ORTTensor.to_canvas({
           tensor: result.normal,
@@ -326,12 +320,11 @@
 
         this.set_state('inference')
         this.enable_controls({ file_input: false, others: false })
-
+        performance.mark('app_infer')
+        
         const input_canvas = this.#input_canvas
         const res = this.#res
         const max_dim = this.#max_dim
-
-        const t0_app = performance.now()
 
         // resize input canvas, preserve aspect ratio
         const working_input_canvas = (max_dim > 0)
@@ -340,7 +333,6 @@
         
         this.set_status('Running inference ...')
         let working_normal_canvas
-        const t0_moge = performance.now()
         try {
           working_normal_canvas = await this.#moge.infer_normal({ canvas: working_input_canvas, res })
         } catch (err) {
@@ -348,9 +340,10 @@
           this.set_status(err.message)
           this.enable_controls({ file_input: true, others: true })
           this.set_state('idle')
+          performance.clearMarks()
+          performance.clearMeasures()
           return
         }
-        const t1_moge = performance.now()
 
         // resize working normal canvas to match the original input canvas
         const normal_canvas = (max_dim > 0)
@@ -368,12 +361,20 @@
         this.enable_controls({ file_input: true, others: true })
         this.set_state('idle')
 
-        const t1_app = performance.now()
-        const dur_app = t1_app - t0_app
-        const dur_moge = t1_moge - t0_moge 
-        const dur_rest = dur_app - dur_moge
-        const fmt = dur => (dur / 1000).toFixed(2) + 's'
-        this.set_status(`Done in ${fmt(dur_app)}. (moge ${fmt(dur_moge)}, rest ${fmt(dur_rest)})`)
+        performance.measure('app_infer', 'app_infer')
+
+        const entry_to_canvas_gpu = performance.getEntriesByName('to_canvas_gpu', 'measure') 
+        const entry_to_canvas_cpu = performance.getEntriesByName('to_canvas_cpu', 'measure')
+        const dur_bilateral = (entry_to_canvas_gpu[0] || entry_to_canvas_cpu[0]).duration
+        const dur_app = performance.getEntriesByName('app_infer', 'measure')[0].duration
+        const dur_moge = performance.getEntriesByName('moge_infer', 'measure')[0].duration
+        const f = (dur) => (dur / 1000).toFixed(3) + 's'
+        const bilateral_backend = entry_to_canvas_gpu[0] ? 'gpu' : 'cpu'
+
+        this.set_status(`Done in ${f(dur_app)} (moge ${f(dur_moge)}, bilateral_${bilateral_backend} ${f(dur_bilateral)}, ...)`)
+        
+        performance.clearMarks()
+        performance.clearMeasures()
       }
       register_events() {
         el_model_container.addEventListener('submit', this.on_submit.bind(this))

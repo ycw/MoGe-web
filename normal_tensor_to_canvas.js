@@ -281,7 +281,14 @@ export async function normal_tensor_to_canvas({
   const device = await get_gpu_device()
 
   if (device) {
-    return await to_canvas_gpu(device, tensor, smoothing_threshold_deg, kernel_radius)
+    performance.mark('to_canvas_gpu')
+    const canvas = await to_canvas_gpu(device, tensor, smoothing_threshold_deg, kernel_radius)
+    performance.measure('to_canvas_gpu', 'to_canvas_gpu')
+    return canvas
   }
-  return to_canvas_cpu(tensor, smoothing_threshold_deg, kernel_radius)
+  
+  performance.mark('to_canvas_cpu')
+  const canvas = to_canvas_cpu(tensor, smoothing_threshold_deg, kernel_radius)
+  performance.measure('to_canvas_cpu', 'to_canvas_cpu')
+  return canvas
 }
