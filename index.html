@@ -135,23 +135,27 @@
 
     class HTMLUtil {
       // Draw any image source to a new canvas
-      static image_to_canvas({ img, contain }) {
+      static image_to_canvas({ img, dw, dh }) {
         const sw = img.width
         const sh = img.height
-        const scale = contain === undefined ? 1 : contain / Math.max(sw, sh)
-        const dw = Math.max(1, sw * scale)  
-        const dh = Math.max(1, sh * scale)
-        const canvas = new OffscreenCanvas(dw, dh)
-        const ctx = canvas.getContext('2d', { willReadFrequently: true, desynchronized: true })
+        const canvas = document.createElement('canvas')
+        canvas.width = dw
+        canvas.height = dh
+        const ctx = canvas.getContext('2d', { willReadFrequently: true, desynchronized: false })
         ctx.drawImage(img, 0, 0, sw, sh, 0, 0, dw, dh)
         return canvas
       }
-      static async canvas_to_image({ canvas }) {
-        const blob = await canvas.convertToBlob()
-        const img = new Image()
-        img.src = URL.createObjectURL(blob)
-        return img
-      }
+      // ===
+      // Deprecated:
+      //  `offscreencanvas.convertToBlob()` is VERY SLOW for hires(8k+)
+      //  Use <canvas> instead, <canvas> lacks "open image in new tab" BTW.
+      // ===
+      // static async canvas_to_image({ canvas }) {
+      //   const blob = await canvas.convertToBlob() // slow for hires
+      //   const img = new Image()
+      //   img.src = URL.createObjectURL(blob)
+      //   return img
+      // }
     }
 
     // ===
@@ -187,12 +191,15 @@
         controls.enableRotate = false
         controls.saveState()
 
-        this.render = () => renderer.render(scene, camera) 
+        const ambient_light = new THREE.AmbientLight('white', Math.PI / 4)
+        scene.add(ambient_light)
 
-        const light0 = new THREE.PointLight('white', 0.5, 0, 2)
+        this.render = () => renderer.render(scene, camera)
+
+        const light0 = new THREE.PointLight('white', Math.PI * 3 / 4, 0, 2)
         const light0_gizmo = new THREE.Mesh(
           new THREE.SphereGeometry(0.05),
-          new THREE.MeshBasicMaterial({ color: 0xffea00, transparent: true })
+          new THREE.MeshBasicMaterial({ color: 'yellow', transparent: true })
         )
         light0_gizmo.add(light0)
         light0_gizmo.position.set(0, 0, 0.1)
@@ -248,20 +255,23 @@
         this.mat.normalMap?.dispose()
         this.mat.normalMap = this.create_canvas_texture({ canvas: normal_canvas })
         this.mat.needsUpdate = true
-        this.mesh.scale.x = input_canvas.width / input_canvas.height
+        this.mesh.scale.set(input_canvas.width / input_canvas.height, 1, 1)
         this.render()
       }
       create_canvas_texture({ canvas }) {
         // resize to fit max texture dimension 2d, avoid crash for hires input
+        const s = this.max_tdim / Math.max(canvas.width, canvas.height)
+        const dw = canvas.width * s
+        const dh = canvas.height * s
         return new THREE.CanvasTexture(
           Math.max(canvas.width, canvas.height) > this.max_tdim
-            ? HTMLUtil.image_to_canvas({ img: canvas, contain: this.max_tdim })
+            ? HTMLUtil.image_to_canvas({ img: canvas, dw, dh })
             : canvas
         )
       }
       reset_controls() {
         this.controls.reset()
-        this.light0_gizmo.position.set(0, 0, 0.1)
+        this.light0_gizmo.position.set(0, 0, 0.01)
         this.render()
       }
     }
@@ -271,21 +281,22 @@
     // ===
 
     new class App {
-      #state = 'setup'
+      #state = 'setup' // 'setup' | 'idle' | 'inference'
       #moge = null
       #previewer = null
       #input_canvas = null // cache
-      #input_img = null // cache, `src` is a blob url
-      #normal_img = null // cache `src` is a blob url
-      #res = 9
-      #max_dim = 518
+      #res = 9 // in range [0,9]
+      #max_dim = 518 // in range [1,SAFE_MAX_DIM]
+      #working_dim2d = [0, 0] // derive from input_canvas dim and max_dim
+      static SAFE_MAX_DIM = 1036
       constructor() {
         this.register_events()
         el_res.value = this.#res
         el_max_dim.value = this.#max_dim
+        el_max_dim.max = App.SAFE_MAX_DIM
       }
       set_input_canvas({ canvas }) {
-        this.#input_canvas = canvas || null
+        this.#input_canvas = canvas
         this.enable_controls({ file_input: true, others: !!canvas })
       }
       enable_controls({ file_input, others }) {
@@ -293,20 +304,11 @@
         el_res.disabled = !others
         el_max_dim.disabled = !others
       }
-      set_images({ input_image, normal_image }) {
-        if (this.#input_img) {
-          URL.revokeObjectURL(this.#input_img.src)
-          this.#input_img.remove()
-        }
-        el_input_image_container.append(input_image)
-        this.#input_img = input_image
-
-        if (this.#normal_img) {
-          URL.revokeObjectURL(this.#normal_img.src)
-          this.#normal_img.remove()
-        }
-        el_normal_image_container.append(normal_image)
-        this.#normal_img = normal_image
+      set_results({ input_canvas, normal_canvas }) {
+        el_input_image_container.querySelector('canvas')?.remove()
+        el_input_image_container.append(input_canvas)
+        el_normal_image_container.querySelector('canvas')?.remove()
+        el_normal_image_container.append(normal_canvas)
       }
       set_state(state) {
         document.body.dataset.state = state
@@ -321,18 +323,29 @@
         this.set_state('inference')
         this.enable_controls({ file_input: false, others: false })
         performance.mark('app_infer')
-        
+
         const input_canvas = this.#input_canvas
         const res = this.#res
         const max_dim = this.#max_dim
 
-        // resize input canvas, preserve aspect ratio
+        const scale = (max_dim > 0) ? max_dim / Math.max(input_canvas.width, input_canvas.height) : 1
+        const working_dim2d = [
+          Math.max(1, input_canvas.width * scale | 0),
+          Math.max(1, input_canvas.height * scale | 0)
+        ]
+        this.#working_dim2d = working_dim2d
+
+        // Resize input canvas, preserve aspect ratio
         const working_input_canvas = (max_dim > 0)
-          ? HTMLUtil.image_to_canvas({ img: input_canvas, contain: max_dim })
+          ? HTMLUtil.image_to_canvas({
+              img: input_canvas,
+              dw: working_dim2d[0],
+              dh: working_dim2d[1]
+            })
           : input_canvas
-        
+
         this.set_status('Running inference ...')
-        let working_normal_canvas
+        let working_normal_canvas // OffscreenCanvas
         try {
           working_normal_canvas = await this.#moge.infer_normal({ canvas: working_input_canvas, res })
         } catch (err) {
@@ -345,17 +358,15 @@
           return
         }
 
-        // resize working normal canvas to match the original input canvas
-        const normal_canvas = (max_dim > 0)
-          ? HTMLUtil.image_to_canvas({
-              img: working_normal_canvas, 
-              contain: Math.max(input_canvas.width, input_canvas.height)
-            })
-          : working_normal_canvas
+        // Resize working normal canvas to match the original input canvas.
+        //  Blindly draw to a new <canvas> which can be appended to the DOM.
+        const normal_canvas = HTMLUtil.image_to_canvas({
+          img: working_normal_canvas,
+          dw: input_canvas.width,
+          dh: input_canvas.height
+        })
 
-        const input_image = await HTMLUtil.canvas_to_image({ canvas: input_canvas })
-        const normal_image = await HTMLUtil.canvas_to_image({ canvas: normal_canvas })
-        this.set_images({ input_image, normal_image })
+        this.set_results({ input_canvas, normal_canvas })
 
         this.#previewer.preview({ input_canvas, normal_canvas })
         this.enable_controls({ file_input: true, others: true })
@@ -369,10 +380,12 @@
         const dur_app = performance.getEntriesByName('app_infer', 'measure')[0].duration
         const dur_moge = performance.getEntriesByName('moge_infer', 'measure')[0].duration
         const f = (dur) => (dur / 1000).toFixed(3) + 's'
-        const bilateral_backend = entry_to_canvas_gpu[0] ? 'gpu' : 'cpu'
+        const backend = entry_to_canvas_gpu[0] ? 'gpu' : 'cpu'
+        const [sw, sh] = this.#working_dim2d
+        const [dw, dh] = [this.#input_canvas.width, this.#input_canvas.height]
 
-        this.set_status(`Done in ${f(dur_app)} (moge ${f(dur_moge)}, bilateral_${bilateral_backend} ${f(dur_bilateral)}, ...)`)
-        
+        this.set_status(`[${sw}x${sh}->${dw}x${dh}] Done in ${f(dur_app)} (moge ${f(dur_moge)}, bilateral_${backend} ${f(dur_bilateral)})`)
+
         performance.clearMarks()
         performance.clearMeasures()
       }
@@ -385,18 +398,26 @@
           ms: 100
         }))
         document.addEventListener('paste', this.on_paste.bind(this))
+
+        window.addEventListener('dragenter', e => { e.preventDefault(); e.stopPropagation() })
+        window.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation() })
+        window.addEventListener('dragleave', e => { e.preventDefault(); e.stopPropagation() })
+        window.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation() })
+        window.addEventListener('drop', this.on_drop.bind(this))
       }
       async on_submit(e) {
         e.preventDefault()
         e.target.hidden = true
         try {
           this.set_status("Loading model ...")
-          const model_url = el_model_url.value
-          const dtype = el_model_dtype.value
+          const radio = Array.from(e.target.elements['model_url']).find(r => r.checked)
+
+          const model_url = radio.dataset.url
+          const dtype = radio.dataset.dtype
           const t0 = performance.now()
           this.#moge = await MoGe2.create({ model_url, dtype })
           const dur = ((performance.now() - t0) / 1000).toFixed(2) 
-          this.set_status(`Model loaded in ${dur}s. Please select image, or paste image`)
+          this.set_status(`Model loaded in ${dur}s`)
           this.#previewer = await Previewer.create({ container_el: el_preview_container })
           this.set_state('idle')
         } catch (err) {
@@ -409,9 +430,13 @@
       async on_input(e) {
         const file = e.target.files[0]
         if (!file) return
-        
+
         const input_bitmap = await createImageBitmap(file)
-        const input_canvas = HTMLUtil.image_to_canvas({ img: input_bitmap })
+        const input_canvas = HTMLUtil.image_to_canvas({
+          img: input_bitmap,
+          dw: input_bitmap.width,
+          dh: input_bitmap.height
+        })
         input_bitmap.close()
 
         this.set_input_canvas({ canvas: input_canvas })
@@ -427,14 +452,30 @@
         await this.infer_normal()
       }
       async on_max_dim_change(e) {
-        this.#max_dim = Number.parseInt(e.target.value, 10)
-        if (Number.isNaN(this.#max_dim) || this.#max_dim < 0) {
-          this.#max_dim = 0  // 0 means no resize
-          e.target.value = 0  // reflect
-        }
+        this.#max_dim = e.target.value = Math.max(1, Math.min(App.SAFE_MAX_DIM,
+          Number.parseInt(e.target.value, 10) || 1  // NaN -> 1
+        ))
         await this.infer_normal()
       }
+      async on_drop(e) {
+        if (this.#state !== 'idle') return
+
+        const files = e.dataTransfer.files
+
+        let image_file = null
+        for (const file of files) {
+          if (file.type.startsWith('image/')) {
+            image_file = file
+            break
+          }
+        }
+        if (image_file) {
+          await this.on_input({ target: { files: [image_file] }}) // fake event
+        }
+      }
       async on_paste(e) {
+        if (this.#state !== 'idle') return
+
         const items = e.clipboardData?.items
         if (!items) return
 
@@ -456,28 +497,52 @@
   <nav>
     <a href="https://github.com/ycw/MoGe-web">MoGe-web</a>
     <a href="https://x.com/ycwhk">@ycwhk</a>
-    <pre id="el_status"><code>Please load model</code></pre>
+    <mark id="el_status"></mark>
   </nav>
   <form id="el_model_container">
-    <input id="el_model_url" value="moge-2-vits-normal-fp16.onnx">
-    <select id="el_model_dtype">
-      <option>float16</option>
-      <option>float32</option>
-    </select>
-    <button type="submit" id="el_model_submit">load model</button>
-    <br>
     <ul>
-      <li>https://ycw.github.io/MoGe-web/moge-2-vits-normal-fp16.onnx |float16| 73 MB</li>
-      <li>https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx |float32| 141 MB</li>
-      <li>https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx |float32| 419 MB</li>
-      <li>https://huggingface.co/Ruicheng/moge-2-vitl-normal-onnx/resolve/main/model.onnx |float32| 1.32 GB</li>
+      <li>
+        <label>
+          <input type="radio" name="model_url" data-url="./moge-2-vits-normal-fp16.onnx" data-dtype="float16" checked>
+          <span>73 MB</span>
+          <span>float16</span>
+          <span>github: ycw/MoGe-web/moge-2-vits-normal-fp16.onnx</span>
+        </label>
+      </li>
+      <li>
+        <label>
+          <input type="radio" name="model_url" data-url="https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx" data-dtype="float32">
+          <span>141 MB</span>
+          <span>float32</span>
+          <span>huggingface: Ruicheng/moge-2-vits-normal-onnx</span>
+        </label>
+      </li>
+      <li>
+        <label>
+          <input type="radio" name="model_url" data-url="https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx" data-dtype="float32">
+          <span>419 MB</span>
+          <span>float32</span>
+          <span>huggingface: Ruicheng/moge-2-vitb-normal-onnx</span>
+        </label>
+      </li>
+      <li>
+        <label>
+          <input type="radio" name="model_url" data-url="https://huggingface.co/Ruicheng/moge-2-vitl-normal-onnx/resolve/main/model.onnx" data-dtype="float32">
+          <span>1.32 GB</span>
+          <span>float32</span>
+          <span>huggingface: Ruicheng/moge-2-vitl-normal-onnx</span>
+        </label>
+      </li>
     </ul>
+    <button type="submit" id="el_model_submit">load model</button>
   </form>
   <main>
     <div id="el_controls">
-      <input type="file" id="el_input" accept="image/*">
-      <label title="Affect tokens count. Higher the res, higher the detail">
-        / Res
+      <label title="Select image, or drop image, or paste image">
+        <input type="file" id="el_input" accept="image/*">
+      </label>
+      <label title="[0,9] Higher the res, higher the detail">
+        Res
         <select id="el_res" disabled>
           <option>0</option>
           <option>1</option>
@@ -491,28 +556,32 @@
           <option>9</option>
         </select>
       </label>
-      <label title="Resize input image for inference, 0=no resize. Only affect inference">
-        / MaxDim
-        <input type="number" id="el_max_dim" disabled min="0">
+      <label title="[1,1036] Resize input image for inference">
+        MaxDim
+        <input type="number" id="el_max_dim" min="1" disabled>
       </label>
     </div>
     <div id="el_input_image_container" class="output_container" hidden>
-      <i class="label">Input</i>
+      <div class="info">
+        <span class="label">IMAGE</span>
+      </div>
     </div>
     <div id="el_normal_image_container" class="output_container" hidden>
-      <i class="label">Normal</i>
+      <div class="info">
+        <span class="label">NORMAL</span>
+      </div>
     </div>
     <div id="el_preview_container" class="output_container" hidden>
-      <i class="label">Preview</i>
+      <div class="info">
+        <span class="label">LIVE PREVIEW</span>
+      </div>
     </div>
   </main>
   <style>
-    html, body { margin: 0; padding: 0; height: 100vh; }
-    pre { display: inline }
+    html, body { margin: 0; padding: 0; height: 100vh }
+    pre { display: inline; margin: 0 }
     [hidden] { display: none !important }
-    label:has([disabled]) { opacity: 0.3 }
-    img { display: block; width: 100%; height: 100%; object-fit: contain; background: #7f7f7f }
-    canvas { display: block; width: 100%; height: 100%; background: #7f7f7f }
+    label:has([disabled]) { opacity: 0.5 }
     select, input, option { border: none; border-bottom: 1px solid #0003 }
     body {
       font: 1em monospace;
@@ -522,33 +591,62 @@
       }
       &:not([data-state=setup]) {
         & #el_model_container { display: none }
-        display: grid; gap: 1px;
-        grid-template-rows: auto minmax(0, 1fr);
-        height: 100vh;
+        display: grid; gap: 1em;
+        grid-template-rows: auto minmax(0,1fr);
       }
     }
+    nav {
+      display: flex; gap: 2ch;
+    }
     main {
-      display: grid; gap: 1px; 
+      display: grid; gap: 1em;
       grid-template:
         'controls controls' auto
         'preview input_image_container' minmax(0,1fr)
         'preview normal_image_container' minmax(0,1fr)
-      / 3fr 2fr;
-    }
-
-    #el_model_container {
-      margin: 1em;
-      & #el_model_url { width: 40vw }
-    }
-    #el_controls { grid-area: controls; margin: 1em }
+      / minmax(50vw,1fr) auto;
+    }    
+    #el_controls { grid-area: controls }
     #el_input_image_container { grid-area: input_image_container }
     #el_normal_image_container { grid-area: normal_image_container }
     #el_preview_container { grid-area: preview }
 
+    #el_model_container {
+      margin: 1em;
+      & #el_model_url { width: 40vw }
+      & ul {
+        list-style-type: none; padding: unset;
+        & li {
+          & label {
+            display: grid; grid-template-columns: auto 8ch 8ch 1fr; gap: 1ch;
+            & > *:nth-child(2) { place-self: end }
+          }
+        }
+      }
+    }
+    #el_controls {
+      display: flex; gap: 0.5em; align-items: baseline;
+      border-radius: 0.5em; overflow: hidden;
+      outline: thin solid currentcolor;
+      & label {
+        max-height: 3em; box-sizing: border-box;
+        padding: 0.5em;
+      }
+    }
     .output_container {
       position: relative;
-      & .label { position: absolute; top: 0; z-index: 1; background: white; padding: 0.5ch }
-      &:hover .label { display: none }
+      border-radius: 0.5em; overflow: hidden;
+      outline: thin solid currentcolor;
+      & .info {
+        position: absolute; z-index: 1;
+        display: grid; grid-template-columns: auto 1fr;
+        & .label { padding: 0 1ch; background: black; color: white }
+        & .content { padding: 0 1ch; background: white; color: black }
+      }
+      & canvas { width: 100%; height: 100%; object-fit: contain }
+    }
+    #el_preview_container {
+      & canvas { object-fit: unset }
     }
   </style>
 </body>
