@@ -38,14 +38,13 @@
           model_precision
         })
       }
-      async infer_normal({ canvas, res=9 }) {
+      async infer_normal({ canvas, num_tokens }) {
         const image_tensor = new ort.Tensor(
           this.model_precision,
           CanvasUtil.to_float_NCHW({ canvas, precision: this.model_precision }),
           [1, 3, canvas.height, canvas.width]
         )
 
-        const num_tokens = (1200 + res / 9 * (3600 - 1200)) | 0  // [0,9] -> [1200,3600]
         const num_tokens_tensor = new ort.Tensor('int64', new BigInt64Array([BigInt(num_tokens)]), [])
 
         performance.mark('moge_infer')
@@ -142,8 +141,16 @@
 
     class MathUtil {
       static scale_to_max_dim({ size, max_dim }) {
-        const s = max_dim / Math.max(...size)
-        return [size[0] * s | 0, size[1] * s | 0]
+        const [w, h] = size
+        const s = max_dim / Math.max(w, h)
+        return [w * s | 0, h * s | 0]
+      }
+      static scale_to_tokens({ size, target_tokens=2000, patch_size=14 }) {
+        const [w, h] = size
+        const scale = Math.sqrt((target_tokens * patch_size * patch_size) / (w * h))
+        const nw = Math.max(1, (w * scale) / patch_size | 0) * patch_size
+        const nh = Math.max(1, (h * scale) / patch_size | 0) * patch_size
+        return { actual_size: [nw, nh], actual_tokens: (nw / patch_size) * (nh / patch_size) }
       }
     }
     
@@ -262,15 +269,13 @@
       #moge = null
       #previewer = null
       #input_canvas = null // cache
-      #res = 9 // in range [0,9]
-      #max_dim = 518 // in range [1,SAFE_MAX_DIM]
-      #working_size = [0, 0] // derive from input_canvas dim and max_dim
-      static SAFE_MAX_DIM = 1036
+      #num_tokens = 1400
+      #num_tokens_range = [100, 4000] // Recommended: [1200, 3600]
       constructor() {
         this.register_events()
-        el_res.value = this.#res
-        el_max_dim.value = this.#max_dim
-        el_max_dim.max = App.SAFE_MAX_DIM
+        el_num_tokens.value = this.#num_tokens
+        el_num_tokens.min = this.#num_tokens_range[0]
+        el_num_tokens.max = this.#num_tokens_range[1]
       }
       set_results({ input_canvas, normal_canvas, mask_canvas }) {
         el_input_image_container.querySelector('canvas')?.remove()
@@ -286,16 +291,13 @@
 
         if (state === 'setup') {
           el_input.disabled = true
-          el_res.disabled = true
-          el_max_dim.disabled = true
+          el_num_tokens.disabled = true
         } else if (state === 'idle') {
           el_input.disabled = false
-          el_res.disabled = !this.#input_canvas
-          el_max_dim.disabled = !this.#input_canvas
+          el_num_tokens.disabled = !this.#input_canvas
         } else if (state === 'inference') {
           el_input.disabled = true
-          el_res.disabled = true
-          el_max_dim.disabled = true
+          el_num_tokens.disabled = true
         }
       }
       set_status(status) {
@@ -309,23 +311,15 @@
         performance.mark('app_infer')
 
         const input_canvas = this.#input_canvas
-        const res = this.#res
-        const max_dim = this.#max_dim
-
         const input_size = [input_canvas.width, input_canvas.height]
-        const working_size = MathUtil.scale_to_max_dim({ size: input_size, max_dim })
-        this.#working_size = working_size
-
-        // ===
-        // input_canvas -> working_input_canvas -> working_normal_canvas -> normal_canvas
-        // ===
-
-        const working_input_canvas = CanvasUtil.from_image({ img: input_canvas, size: working_size })
+        const num_tokens = this.#num_tokens
+        const working = {} // holds size,input_canvas,normal_canvas,mask_canvas
+        working.size = MathUtil.scale_to_tokens({ size: input_size, target_tokens: num_tokens }).actual_size
+        working.input_canvas = CanvasUtil.from_image({ img: input_canvas, size: working.size })
 
         this.set_status('Running inference ...')
-        const working = {}
         try {
-          Object.assign(working, await this.#moge.infer_normal({ canvas: working_input_canvas, res }))
+          Object.assign(working, await this.#moge.infer_normal({ canvas: working.input_canvas, num_tokens }))
         } catch (err) {
           console.error(err)
           this.set_status(err.message)
@@ -337,7 +331,6 @@
 
         const normal_canvas = CanvasUtil.from_image({ img: working.normal_canvas, size: input_size })
         const mask_canvas = CanvasUtil.from_image({ img: working.mask_canvas, size: input_size })
-
         this.set_results({ input_canvas, normal_canvas, mask_canvas })
 
         this.#previewer.preview({ input_canvas, normal_canvas })
@@ -350,7 +343,7 @@
         const dur_moge = performance.getEntriesByName('moge_infer', 'measure')[0].duration
         const f = (dur) => (dur / 1000).toFixed(3) + 's'
         const backend = this.#moge.tensor_postprocess_backend
-        const [sw, sh] = working_size
+        const [sw, sh] = working.size
         const [dw, dh] = input_size
 
         this.set_status(`[${sw}x${sh}->${dw}x${dh}] Done in ${f(dur_app)} (moge ${f(dur_moge)}, tensor_postprocess_${backend} ${f(dur_pp)})`)
@@ -361,9 +354,8 @@
       register_events() {
         el_model_container.addEventListener('submit', this.on_submit.bind(this))
         el_input.addEventListener('input', this.on_input.bind(this))
-        el_res.addEventListener('change', this.on_res_change.bind(this))
-        el_max_dim.addEventListener('change', FuncUtil.debounce({
-          fn: this.on_max_dim_change.bind(this),
+        el_num_tokens.addEventListener('change', FuncUtil.debounce({
+          fn: this.on_num_tokens_change.bind(this),
           ms: 100
         }))
 
@@ -436,14 +428,11 @@
         const files = Array.from(items).filter(i => i.type.startsWith('image/')).map(i => i.getAsFile())
         await this.on_input({ target: { files } }) // fake event
       }
-      async on_res_change(e) {
-        this.#res = Number.parseInt(e.target.value, 10)
-        await this.infer_normal()
-      }
-      async on_max_dim_change(e) {
-        const value = Number.parseInt(e.target.value, 10) || 1  // NaN -> 1
-        const clamped = Math.max(1, Math.min(App.SAFE_MAX_DIM, value))
-        this.#max_dim = e.target.value = clamped
+      async on_num_tokens_change(e) {
+        const value = Number.parseInt(e.target.value, 10)
+        const [min, max] = this.#num_tokens_range
+        const clamped = Math.max(min, Math.min(max, value))
+        this.#num_tokens = e.target.value = clamped
         await this.infer_normal()
       }
     }
@@ -497,24 +486,9 @@
       <label title="Select image, or drop image, or paste image">
         <input type="file" id="el_input" accept="image/*">
       </label>
-      <label title="[0,9] Higher the res, higher the detail">
-        Res
-        <select id="el_res" disabled>
-          <option>0</option>
-          <option>1</option>
-          <option>2</option>
-          <option>3</option>
-          <option>4</option>
-          <option>5</option>
-          <option>6</option>
-          <option>7</option>
-          <option>8</option>
-          <option>9</option>
-        </select>
-      </label>
-      <label title="[1,1036] Resize input image for inference">
-        MaxDim
-        <input type="number" id="el_max_dim" min="1" disabled>
+      <label title="Higher token count yields higher detail. Recommended: [1200, 3600]">
+        Tokens
+        <input type="number" id="el_num_tokens" step="100" disabled>
       </label>
     </div>
     <div id="el_input_image_container" class="output_container" hidden>
@@ -534,7 +508,7 @@
     </div>
     <div id="el_preview_container" class="output_container" hidden>
       <div class="info">
-        <span class="label">INTERACTIVE PREVIEW</span>
+        <span class="label">PREVIEW</span>
       </div>
     </div>
   </main>
