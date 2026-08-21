@@ -27,7 +27,7 @@
       constructor({ inference_session, model_precision }) {
         this.inference_session = inference_session
         this.model_precision = model_precision
-        this.normal_tensor_to_canvas_backend = '' // derived during infer_normal
+        this.tensor_postprocess_backend = '' // derived during infer_normal
       }
       static async create({ model_url, model_precision }) {
         return new ORTMoge2({
@@ -51,11 +51,36 @@
         performance.mark('moge_infer')
         const result = await this.inference_session.run({ image: image_tensor, num_tokens: num_tokens_tensor })
         performance.measure('moge_infer', 'moge_infer')
+        console.log({result})
+
+        const output = { normal_canvas: null, mask_canvas: null }
 
         performance.mark('normal_tensor_to_canvas')
-        const { backend, normal_canvas } = await normal_tensor_to_canvas({ tensor: result.normal })
+        const { backend, normal_canvas } = await normal_tensor_to_canvas({
+          normal_tensor: result.normal,
+          mask_tensor: result.mask
+        })
         performance.measure('normal_tensor_to_canvas', 'normal_tensor_to_canvas')
-        this.normal_tensor_to_canvas_backend = backend
+        this.tensor_postprocess_backend = backend
+        output.normal_canvas = normal_canvas
+
+        { // === Generate mask canvas ===
+          const sh = result.mask.dims[1]
+          const sw = result.mask.dims[2]
+          const n_pixels = sw * sh
+          const mask_src = result.mask.data // f32a
+          const img_data = new ImageData(sw, sh)
+          const buf32 = new Uint32Array(img_data.data.buffer)
+          for(let i = 0; i < n_pixels; ++i) {
+            const mask = mask_src[i] * 255 | 0
+            buf32[i] = 0xff000000 | (mask << 16) | (mask << 8) | mask // little endian 0xAABBGGRR
+          }
+          const mask_canvas = document.createElement('canvas')
+          mask_canvas.width = sw
+          mask_canvas.height = sh
+          mask_canvas.getContext('2d').putImageData(img_data, 0, 0)
+          output.mask_canvas = mask_canvas
+        }
 
         result.mask?.dispose()
         result.normal?.dispose()
@@ -65,7 +90,7 @@
         image_tensor.dispose()
         num_tokens_tensor.dispose()
 
-        return normal_canvas
+        return output
       }
     }
 
@@ -74,19 +99,25 @@
     // ===
 
     class CanvasUtil {
+      static LUT_255 = Float32Array.from({ length: 256 }, (_, i) => i / 255)
       static to_float_NCHW({ canvas, precision='float16' }) {
         const [sw, sh] = [canvas.width, canvas.height]
-        const src = canvas.getContext('2d').getImageData(0, 0, sw, sh).data
         const n_pixels = sw * sh
-        const dst = new (precision === 'float16' ? Float16Array : Float32Array)(3 * n_pixels)
+        const src = canvas.getContext('2d').getImageData(0, 0, sw, sh).data // u8ca
+        // NOTE: Pass byteOffset as engine buffers may not align at 0 (e.g. memory pool)
+        const src_u32 = new Uint32Array(src.buffer, src.byteOffset, n_pixels)
+        const ArrayCtor = (precision === 'float16') ? Float16Array : Float32Array
+        const dst = new ArrayCtor(3 * n_pixels)
         const g0 = n_pixels
         const b0 = n_pixels * 2
-        for (let i = 0, j = 0; i < 4 * n_pixels; i += 4, j += 1) {
-          dst[j] = src[i] / 255
-          dst[g0 + j] = src[i + 1] / 255 // g
-          dst[b0 + j] = src[i + 2] / 255 // b
+        const LUT = CanvasUtil.LUT_255
+        for (let i = 0; i < n_pixels; ++i) {
+          const px = src_u32[i] // little endian data packing 0xAABBGGRR
+          dst[i] = LUT[px & 0xff] // r
+          dst[g0 + i] = LUT[(px >> 8) & 0xff] // g
+          dst[b0 + i] = LUT[(px >> 16) & 0xff] // b
         }
-        return dst 
+        return dst
       }
       static from_image({ img, size=null }) {
         const [sw, sh] = [img.width, img.height]
@@ -132,7 +163,7 @@
         const drag_controls = new DragControls([], camera, renderer.domElement)
         
         renderer.toneMapping = THREE.AgXToneMapping
-        renderer.toneMappingExposure = 0.3
+        renderer.toneMappingExposure = 0.5
         camera.position.set(0, 0, 4)
         controls.saveState()
         controls.enableRotate = false
@@ -141,8 +172,8 @@
 
         this.render = () => renderer.render(scene, camera)
 
-        scene.add(new THREE.AmbientLight('white', Math.PI))
-        const light0 = new THREE.PointLight('white', Math.PI * 0.7, 0, 2)
+        scene.add(new THREE.AmbientLight('white', Math.PI * 0.5))
+        const light0 = new THREE.PointLight('white', Math.PI, 0, 2)
         const light0_gizmo = new THREE.Mesh(
           new THREE.BoxGeometry(9e9, 9e9, 0.1),
           new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 })
@@ -151,7 +182,7 @@
         scene.add(light0_gizmo)
         drag_controls.objects.push(light0_gizmo)
 
-        const LIGHT0_Z = 0.1
+        const LIGHT0_Z = 0.05
         const cross_mesh = new THREE.GridHelper(9e9, 2, 'black')
         cross_mesh.geometry.rotateX(-Math.PI / 2).translate(0, 0, LIGHT0_Z * -0.99)
         light0_gizmo.add(cross_mesh)
@@ -241,11 +272,13 @@
         el_max_dim.value = this.#max_dim
         el_max_dim.max = App.SAFE_MAX_DIM
       }
-      set_results({ input_canvas, normal_canvas }) {
+      set_results({ input_canvas, normal_canvas, mask_canvas }) {
         el_input_image_container.querySelector('canvas')?.remove()
         el_input_image_container.append(input_canvas)
         el_normal_image_container.querySelector('canvas')?.remove()
         el_normal_image_container.append(normal_canvas)
+        el_mask_image_container.querySelector('canvas')?.remove()
+        el_mask_image_container.append(mask_canvas)
       }
       set_state(state) {
         document.body.dataset.state = state
@@ -290,9 +323,9 @@
         const working_input_canvas = CanvasUtil.from_image({ img: input_canvas, size: working_size })
 
         this.set_status('Running inference ...')
-        let working_normal_canvas // OffscreenCanvas
+        const working = {}
         try {
-          working_normal_canvas = await this.#moge.infer_normal({ canvas: working_input_canvas, res })
+          Object.assign(working, await this.#moge.infer_normal({ canvas: working_input_canvas, res }))
         } catch (err) {
           console.error(err)
           this.set_status(err.message)
@@ -302,24 +335,25 @@
           return
         }
 
-        const normal_canvas = CanvasUtil.from_image({ img: working_normal_canvas, size: input_size })
+        const normal_canvas = CanvasUtil.from_image({ img: working.normal_canvas, size: input_size })
+        const mask_canvas = CanvasUtil.from_image({ img: working.mask_canvas, size: input_size })
 
-        this.set_results({ input_canvas, normal_canvas })
+        this.set_results({ input_canvas, normal_canvas, mask_canvas })
 
         this.#previewer.preview({ input_canvas, normal_canvas })
         this.set_state('idle')
 
         performance.measure('app_infer', 'app_infer')
 
-        const dur_dump = performance.getEntriesByName('normal_tensor_to_canvas', 'measure')[0].duration
+        const dur_pp = performance.getEntriesByName('normal_tensor_to_canvas', 'measure')[0].duration
         const dur_app = performance.getEntriesByName('app_infer', 'measure')[0].duration
         const dur_moge = performance.getEntriesByName('moge_infer', 'measure')[0].duration
         const f = (dur) => (dur / 1000).toFixed(3) + 's'
-        const backend = this.#moge.normal_tensor_to_canvas_backend
+        const backend = this.#moge.tensor_postprocess_backend
         const [sw, sh] = working_size
         const [dw, dh] = input_size
 
-        this.set_status(`[${sw}x${sh}->${dw}x${dh}] Done in ${f(dur_app)} (moge ${f(dur_moge)}, bilateral_${backend} ${f(dur_dump)})`)
+        this.set_status(`[${sw}x${sh}->${dw}x${dh}] Done in ${f(dur_app)} (moge ${f(dur_moge)}, tensor_postprocess_${backend} ${f(dur_pp)})`)
 
         performance.clearMarks()
         performance.clearMeasures()
@@ -384,6 +418,7 @@
 
         el_input_image_container.hidden = false
         el_normal_image_container.hidden = false
+        el_mask_image_container.hidden = false
         el_preview_container.hidden = false
       }
       async on_drop(e) {
@@ -492,9 +527,14 @@
         <span class="label">NORMAL</span>
       </div>
     </div>
+    <div id="el_mask_image_container" class="output_container" hidden>
+      <div class="info">
+        <span class="label">MASK</span>
+      </div>
+    </div>
     <div id="el_preview_container" class="output_container" hidden>
       <div class="info">
-        <span class="label">LIVE PREVIEW</span>
+        <span class="label">INTERACTIVE PREVIEW</span>
       </div>
     </div>
   </main>
@@ -517,14 +557,15 @@
     main {
       display: grid; gap: 1em;
       grid-template:
-        'controls controls' auto
-        'preview input_image_container' minmax(0,1fr)
-        'preview normal_image_container' minmax(0,1fr)
-      / minmax(60vw,1fr) auto;
+        'controls controls controls' auto
+        'preview input_image_container normal_image_container' minmax(0,1fr)
+        'preview mask_image_container _' minmax(0,1fr)
+      / minmax(50vw,1fr) auto auto;
     }    
     #el_controls { grid-area: controls }
     #el_input_image_container { grid-area: input_image_container }
     #el_normal_image_container { grid-area: normal_image_container }
+    #el_mask_image_container { grid-area: mask_image_container }
     #el_preview_container { grid-area: preview }
 
     #el_model_container {
