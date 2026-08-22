@@ -52,7 +52,7 @@
         performance.measure('moge_infer', 'moge_infer')
         console.log({result})
 
-        const output = { normal_canvas: null, mask_canvas: null }
+        const output = {} // normal_canvas,mask_canvas,depth8_canvas
 
         performance.mark('normal_tensor_to_canvas')
         const { backend, normal_canvas } = await normal_tensor_to_canvas({
@@ -79,6 +79,48 @@
           mask_canvas.height = sh
           mask_canvas.getContext('2d').putImageData(img_data, 0, 0)
           output.mask_canvas = mask_canvas
+        }
+
+        { // === Generate depth canvas ===
+          const sh = result.points.dims[1]
+          const sw = result.points.dims[2]
+          const n_pixels = sw * sh
+          const src = result.points.data // NHWC
+          const mask = result.mask.data
+
+          let min_z = Infinity
+          let max_z = -Infinity
+
+          for (let i = 0; i < n_pixels; ++i) {
+            if (mask[i] < 0.5) continue
+            const z = src[i * 3 + 2]
+            if (z < min_z) min_z = z
+            if (z > max_z) max_z = z
+          }
+
+          const z_range = max_z - min_z
+          const inv_z_range = (z_range > 1e-6) ? 1.0 / z_range : 0 // cache norm factor
+
+          const depth8_imgdata = new ImageData(sw, sh)
+          const depth8_buf32 = new Uint32Array(depth8_imgdata.data.buffer)
+
+          for (let i = 0; i < n_pixels; ++i) {
+            if (mask[i] < 0.5) {
+              depth8_buf32[i] = 0xff000000 // =far
+              continue
+            }
+            const z = src[i * 3 + 2]
+            const norm_z = Math.max(0.0, Math.min(1.0, (max_z - z) * inv_z_range)) //far=0,near=1
+            const packed_8bit = norm_z * 255 | 0  // 2**8=255
+            const r = packed_8bit & 0xff
+            depth8_buf32[i] = 0xff000000 | (r << 16) | (r << 8) | r // little-endian 0xAABBGGRR
+          }
+
+          const depth8_canvas = document.createElement('canvas')
+          depth8_canvas.width = sw
+          depth8_canvas.height = sh
+          depth8_canvas.getContext('2d').putImageData(depth8_imgdata, 0, 0)
+          output.depth8_canvas = depth8_canvas
         }
 
         result.mask?.dispose()
@@ -277,13 +319,15 @@
         el_num_tokens.min = this.#num_tokens_range[0]
         el_num_tokens.max = this.#num_tokens_range[1]
       }
-      set_results({ input_canvas, normal_canvas, mask_canvas }) {
+      set_results({ input_canvas, normal_canvas, mask_canvas, depth8_canvas }) {
         el_input_image_container.querySelector('canvas')?.remove()
         el_input_image_container.append(input_canvas)
         el_normal_image_container.querySelector('canvas')?.remove()
         el_normal_image_container.append(normal_canvas)
         el_mask_image_container.querySelector('canvas')?.remove()
         el_mask_image_container.append(mask_canvas)
+        el_depth_image_container.querySelector('canvas')?.remove()
+        el_depth_image_container.append(depth8_canvas)
       }
       set_state(state) {
         document.body.dataset.state = state
@@ -313,7 +357,7 @@
         const input_canvas = this.#input_canvas
         const input_size = [input_canvas.width, input_canvas.height]
         const num_tokens = this.#num_tokens
-        const working = {} // holds size,input_canvas,normal_canvas,mask_canvas
+        const working = {} // size,input_canvas,normal_canvas,mask_canvas,depth8_canvas
         working.size = MathUtil.scale_to_tokens({ size: input_size, target_tokens: num_tokens }).actual_size
         working.input_canvas = CanvasUtil.from_image({ img: input_canvas, size: working.size })
 
@@ -331,7 +375,8 @@
 
         const normal_canvas = CanvasUtil.from_image({ img: working.normal_canvas, size: input_size })
         const mask_canvas = CanvasUtil.from_image({ img: working.mask_canvas, size: input_size })
-        this.set_results({ input_canvas, normal_canvas, mask_canvas })
+        const depth8_canvas = CanvasUtil.from_image({ img: working.depth8_canvas, size: input_size })
+        this.set_results({ input_canvas, normal_canvas, mask_canvas, depth8_canvas })
 
         this.#previewer.preview({ input_canvas, normal_canvas })
         this.set_state('idle')
@@ -411,6 +456,7 @@
         el_input_image_container.hidden = false
         el_normal_image_container.hidden = false
         el_mask_image_container.hidden = false
+        el_depth_image_container.hidden = false
         el_preview_container.hidden = false
       }
       async on_drop(e) {
@@ -506,6 +552,11 @@
         <span class="label">MASK</span>
       </div>
     </div>
+    <div id="el_depth_image_container" class="output_container" hidden>
+      <div class="info">
+        <span class="label">DEPTH</span>
+      </div>
+    </div>
     <div id="el_preview_container" class="output_container" hidden>
       <div class="info">
         <span class="label">PREVIEW</span>
@@ -533,13 +584,14 @@
       grid-template:
         'controls controls controls' auto
         'preview input_image_container normal_image_container' minmax(0,1fr)
-        'preview mask_image_container _' minmax(0,1fr)
+        'preview mask_image_container depth_image_container' minmax(0,1fr)
       / minmax(50vw,1fr) auto auto;
     }    
     #el_controls { grid-area: controls }
     #el_input_image_container { grid-area: input_image_container }
     #el_normal_image_container { grid-area: normal_image_container }
     #el_mask_image_container { grid-area: mask_image_container }
+    #el_depth_image_container { grid-area: depth_image_container }
     #el_preview_container { grid-area: preview }
 
     #el_model_container {
